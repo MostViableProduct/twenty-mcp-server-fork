@@ -73,6 +73,7 @@
   "dependencies": {
     "@clerk/clerk-sdk-node": "^5.0.0",
     "@clerk/types": "^4.0.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/inquirer": "^9.0.8",
     "chalk": "^5.4.1",
     "commander": "^14.0.0",
@@ -82,7 +83,6 @@
     "zod": "^3.22.4"
   },
   "devDependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/node": "^20.10.0",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",
