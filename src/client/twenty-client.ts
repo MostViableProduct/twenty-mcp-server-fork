@@ -1,5 +1,35 @@
 import { GraphQLClient } from 'graphql-request';
-import { TwentyConfig, Person, Company, Task, Note, SearchOptions } from '../types/twenty.js';
+import { TwentyConfig, Person, Company, Task, Note, SearchOptions, RichTextInput } from '../types/twenty.js';
+
+// Note/Task in Twenty v2.x carry a RichText `bodyV2` instead of plaintext `body`.
+// Callers can pass either; we normalise on input and lift back to a plain
+// `body` string on output so consumers don't need to know the wire shape.
+type WithBodyV2<T> = Omit<T, 'body' | 'bodyV2'> & { bodyV2?: { markdown?: string | null } | null };
+type TaskWithBodyV2 = WithBodyV2<Task>;
+type NoteWithBodyV2 = WithBodyV2<Note>;
+
+function normaliseRichTextEntity<T extends { body?: string; bodyV2?: RichTextInput }>(input: T): Omit<T, 'body'> {
+  const { body, bodyV2, ...rest } = input;
+  if (bodyV2) return { ...rest, bodyV2 } as Omit<T, 'body'>;
+  if (typeof body === 'string') return { ...rest, bodyV2: { markdown: body } } as Omit<T, 'body'>;
+  return rest as Omit<T, 'body'>;
+}
+
+function liftRichTextEntity<E extends { id?: string; title?: string }>(
+  input: E & { bodyV2?: { markdown?: string | null } | null },
+): E & { body?: string; bodyV2?: RichTextInput } {
+  const { bodyV2, ...rest } = input;
+  const lifted: E & { body?: string; bodyV2?: RichTextInput } = { ...(rest as E) };
+  if (bodyV2) {
+    if (typeof bodyV2.markdown === 'string') {
+      lifted.body = bodyV2.markdown;
+      lifted.bodyV2 = { markdown: bodyV2.markdown };
+    } else {
+      lifted.bodyV2 = {};
+    }
+  }
+  return lifted;
+}
 import { Opportunity, CreateOpportunityInput, UpdateOpportunityInput, SearchOpportunitiesInput } from '../types/opportunities.js';
 import { Activity, Comment, CreateCommentInput, ActivityFilter, EntityActivitiesInput, ActivityTimeline } from '../types/activities.js';
 import { ObjectMetadata, FieldMetadata, ObjectSchema, ObjectSummary, MetadataQueryOptions, FieldQueryOptions } from '../types/metadata.js';
@@ -16,17 +46,22 @@ import {
 } from '../types/relationships.js';
 
 export class TwentyClient {
+  // Data-API client: workspace records (Person, Company, Note, Task, custom objects).
   private client: GraphQLClient;
+  // Metadata-API client: object/field schema introspection (added in v2.x — the
+  // metadata endpoint diverged from the data endpoint and the queries below
+  // hit /metadata, not /graphql).
+  private metaClient: GraphQLClient;
   private baseUrl: string;
 
   constructor(config: TwentyConfig) {
     this.baseUrl = config.baseUrl || 'https://api.twenty.com';
-    this.client = new GraphQLClient(`${this.baseUrl}/graphql`, {
-      headers: {
-        'Authorization': `Bearer ${config.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-    });
+    const headers = {
+      'Authorization': `Bearer ${config.apiKey}`,
+      'Content-Type': 'application/json',
+    };
+    this.client = new GraphQLClient(`${this.baseUrl}/graphql`, { headers });
+    this.metaClient = new GraphQLClient(`${this.baseUrl}/metadata`, { headers });
   }
 
   async createPerson(person: Person): Promise<Person> {
@@ -353,12 +388,13 @@ export class TwentyClient {
   }
 
   async createTask(task: Task): Promise<Task> {
+    const data = normaliseRichTextEntity(task);
     const mutation = `
       mutation CreateTask($data: TaskCreateInput!) {
         createTask(data: $data) {
           id
           title
-          body
+          bodyV2 { markdown }
           dueAt
           status
           assigneeId
@@ -366,11 +402,11 @@ export class TwentyClient {
       }
     `;
 
-    const result = await this.client.request(mutation, { data: task }) as { createTask: Task };
-    return result.createTask;
+    const result = await this.client.request(mutation, { data }) as { createTask: TaskWithBodyV2 };
+    return liftRichTextEntity(result.createTask);
   }
 
-  async getTasks(options: SearchOptions = {}): Promise<Task[]> {
+  async getTasks(_options: SearchOptions = {}): Promise<Task[]> {
     const query = `
       {
         tasks {
@@ -378,7 +414,7 @@ export class TwentyClient {
             node {
               id
               title
-              body
+              bodyV2 { markdown }
               status
             }
           }
@@ -386,25 +422,25 @@ export class TwentyClient {
       }
     `;
 
-    const result = await this.client.request(query) as { tasks: { edges: { node: Task }[] } };
-
-    return result.tasks.edges.map(edge => edge.node);
+    const result = await this.client.request(query) as { tasks: { edges: { node: TaskWithBodyV2 }[] } };
+    return result.tasks.edges.map(edge => liftRichTextEntity(edge.node));
   }
 
   async createNote(note: Note): Promise<Note> {
+    const data = normaliseRichTextEntity(note);
     const mutation = `
       mutation CreateNote($data: NoteCreateInput!) {
         createNote(data: $data) {
           id
           title
-          body
-          authorId
+          bodyV2 { markdown }
+          createdBy { source name }
         }
       }
     `;
 
-    const result = await this.client.request(mutation, { data: note }) as { createNote: Note };
-    return result.createNote;
+    const result = await this.client.request(mutation, { data }) as { createNote: NoteWithBodyV2 };
+    return liftRichTextEntity(result.createNote);
   }
 
   async createOpportunity(opportunity: CreateOpportunityInput): Promise<Opportunity> {
@@ -750,9 +786,13 @@ export class TwentyClient {
   }
 
   async listAllObjects(options: MetadataQueryOptions = {}): Promise<ObjectSummary> {
+    // Twenty v2.x: object metadata lives at /metadata, not /graphql.
+    // The connection has no totalCount, paging is { first: N }, and the
+    // filter input is ObjectFilter (BooleanFieldComparison sub-shapes,
+    // e.g. isActive: { is: true }).
     const query = `
-      query GetObjectMetadata {
-        objects {
+      query GetObjectMetadata($paging: CursorPaging) {
+        objects(paging: $paging) {
           edges {
             node {
               id
@@ -773,7 +813,9 @@ export class TwentyClient {
       }
     `;
 
-    const result = await this.client.request(query) as { objects: { edges: { node: ObjectMetadata }[] } };
+    const result = await this.metaClient.request(query, {
+      paging: { first: 200 },
+    }) as { objects: { edges: { node: ObjectMetadata }[] } };
     const allObjects = result.objects.edges.map(edge => edge.node);
 
     // Filter based on options
@@ -808,11 +850,16 @@ export class TwentyClient {
   }
 
   async getObjectSchema(objectNameOrId: string): Promise<ObjectSchema> {
-    const objectQuery = `
-      query GetObjectSchema($filter: ObjectFilterInput!) {
-        objects(filter: $filter) {
-          edges {
-            node {
+    // ObjectFilter in v2.x can filter by id/isCustom/isActive/etc., but
+    // *not* by nameSingular/namePlural — those aren't in the input shape.
+    // For UUID lookup we use object(id:); for name lookup we fetch the
+    // active set with their fieldsList and filter client-side.
+    const isUuid = /^[0-9a-fA-F-]{36}$/.test(objectNameOrId);
+    if (isUuid) {
+      const result = await this.metaClient.request(
+        `
+          query GetObjectById($id: UUID!) {
+            object(id: $id) {
               id
               nameSingular
               namePlural
@@ -825,135 +872,7 @@ export class TwentyClient {
               isSystem
               createdAt
               updatedAt
-              fields {
-                edges {
-                  node {
-                    id
-                    name
-                    label
-                    description
-                    type
-                    isCustom
-                    isActive
-                    isNullable
-                    isSystem
-                    defaultValue
-                    createdAt
-                    updatedAt
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    `;
-
-    // Try to find object by name first, then by ID
-    let filter;
-    if (objectNameOrId.match(/^[0-9a-fA-F-]{36}$/)) {
-      // Looks like a UUID
-      filter = { id: { eq: objectNameOrId } };
-    } else {
-      // Assume it's a name
-      filter = { 
-        or: [
-          { nameSingular: { eq: objectNameOrId } },
-          { namePlural: { eq: objectNameOrId } }
-        ]
-      };
-    }
-
-    const result = await this.client.request(objectQuery, { filter }) as { 
-      objects: { 
-        edges: { 
-          node: ObjectMetadata & { 
-            fields: { edges: { node: FieldMetadata }[] } 
-          }
-        }[] 
-      } 
-    };
-
-    if (result.objects.edges.length === 0) {
-      throw new Error(`Object not found: ${objectNameOrId}`);
-    }
-
-    const objectNode = result.objects.edges[0].node;
-    const fields = objectNode.fields.edges.map(edge => edge.node);
-
-    return {
-      object: {
-        id: objectNode.id,
-        nameSingular: objectNode.nameSingular,
-        namePlural: objectNode.namePlural,
-        labelSingular: objectNode.labelSingular,
-        labelPlural: objectNode.labelPlural,
-        description: objectNode.description,
-        icon: objectNode.icon,
-        isCustom: objectNode.isCustom,
-        isActive: objectNode.isActive,
-        isSystem: objectNode.isSystem,
-        createdAt: objectNode.createdAt,
-        updatedAt: objectNode.updatedAt,
-        fields
-      },
-      fields,
-      relationships: [] // TODO: Implement relationship discovery
-    };
-  }
-
-  async getFieldMetadata(options: FieldQueryOptions = {}): Promise<FieldMetadata[]> {
-    let query: string;
-    let variables: any = {};
-
-    if (options.objectId || options.objectName) {
-      // Get fields for a specific object
-      query = `
-        query GetFieldsForObject($filter: ObjectFilterInput!) {
-          objects(filter: $filter) {
-            edges {
-              node {
-                fields {
-                  edges {
-                    node {
-                      id
-                      name
-                      label
-                      description
-                      type
-                      isCustom
-                      isActive
-                      isNullable
-                      isSystem
-                      defaultValue
-                      createdAt
-                      updatedAt
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      `;
-
-      if (options.objectId) {
-        variables.filter = { id: { eq: options.objectId } };
-      } else {
-        variables.filter = { 
-          or: [
-            { nameSingular: { eq: options.objectName } },
-            { namePlural: { eq: options.objectName } }
-          ]
-        };
-      }
-    } else {
-      // Get all fields across all objects
-      query = `
-        query GetAllFields {
-          fields {
-            edges {
-              node {
+              fieldsList {
                 id
                 name
                 label
@@ -969,21 +888,121 @@ export class TwentyClient {
               }
             }
           }
-        }
-      `;
+        `,
+        { id: objectNameOrId },
+      ) as { object: (ObjectMetadata & { fieldsList: FieldMetadata[] }) | null };
+
+      if (!result.object) {
+        throw new Error(`Object not found: ${objectNameOrId}`);
+      }
+      const objectNode = result.object;
+      const fields = objectNode.fieldsList ?? [];
+      return {
+        object: { ...objectNode, fields },
+        fields,
+        relationships: [],
+      };
     }
 
-    const result = await this.client.request(query, variables) as any;
-    
+    // Name lookup: list active objects, filter client-side by singular/plural.
+    const listResult = await this.metaClient.request(
+      `
+        query GetObjectsByName($paging: CursorPaging) {
+          objects(paging: $paging, filter: { isActive: { is: true } }) {
+            edges {
+              node {
+                id
+                nameSingular
+                namePlural
+                labelSingular
+                labelPlural
+                description
+                icon
+                isCustom
+                isActive
+                isSystem
+                createdAt
+                updatedAt
+                fieldsList {
+                  id
+                  name
+                  label
+                  description
+                  type
+                  isCustom
+                  isActive
+                  isNullable
+                  isSystem
+                  defaultValue
+                  createdAt
+                  updatedAt
+                }
+              }
+            }
+          }
+        }
+      `,
+      { paging: { first: 200 } },
+    ) as {
+      objects: {
+        edges: { node: ObjectMetadata & { fieldsList: FieldMetadata[] } }[];
+      };
+    };
+
+    const needle = objectNameOrId.toLowerCase();
+    const match = listResult.objects.edges
+      .map(e => e.node)
+      .find(o => o.nameSingular.toLowerCase() === needle || o.namePlural.toLowerCase() === needle);
+
+    if (!match) {
+      throw new Error(`Object not found: ${objectNameOrId}`);
+    }
+
+    const fields = match.fieldsList ?? [];
+    return {
+      object: { ...match, fields },
+      fields,
+      relationships: [],
+    };
+  }
+
+  async getFieldMetadata(options: FieldQueryOptions = {}): Promise<FieldMetadata[]> {
     let fields: FieldMetadata[];
-    
+
     if (options.objectId || options.objectName) {
-      if (result.objects.edges.length === 0) {
-        throw new Error(`Object not found: ${options.objectId || options.objectName}`);
-      }
-      fields = result.objects.edges[0].node.fields.edges.map((edge: any) => edge.node);
+      // Per-object: reuse getObjectSchema's name/UUID handling and pull fieldsList.
+      const schema = await this.getObjectSchema(
+        options.objectId ?? (options.objectName as string),
+      );
+      fields = schema.fields;
     } else {
-      fields = result.fields.edges.map((edge: any) => edge.node);
+      // All-fields: the metadata API exposes a top-level `fields` connection.
+      const result = await this.metaClient.request(
+        `
+          query GetAllFields($paging: CursorPaging) {
+            fields(paging: $paging) {
+              edges {
+                node {
+                  id
+                  name
+                  label
+                  description
+                  type
+                  isCustom
+                  isActive
+                  isNullable
+                  isSystem
+                  defaultValue
+                  createdAt
+                  updatedAt
+                }
+              }
+            }
+          }
+        `,
+        { paging: { first: 1000 } },
+      ) as { fields: { edges: { node: FieldMetadata }[] } };
+      fields = result.fields.edges.map(e => e.node);
     }
 
     // Apply filters

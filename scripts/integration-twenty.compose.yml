@@ -1,0 +1,71 @@
+x-twenty-env: &twenty-env
+  NODE_PORT: "3000"
+  SERVER_URL: "http://localhost:3300"
+  APP_SECRET: ${APP_SECRET}
+  IS_CONFIG_VARIABLES_IN_DB_ENABLED: "false"
+  PG_DATABASE_USER: postgres
+  PG_DATABASE_PASSWORD: ${PG_DATABASE_PASSWORD}
+  PG_DATABASE_HOST: db
+  PG_DATABASE_PORT: "5432"
+  PG_DATABASE_URL: postgres://postgres:${PG_DATABASE_PASSWORD}@db:5432/default
+  REDIS_URL: redis://redis:6379
+  STORAGE_TYPE: local
+  EMAIL_DRIVER: logger
+  NODE_ENV: development
+
+services:
+  server:
+    image: twentycrm/twenty:${TWENTY_TAG:-v2.2.0}
+    environment:
+      <<: *twenty-env
+    ports:
+      - "127.0.0.1:3300:3000"
+    volumes:
+      - server-data:/app/packages/twenty-server/.local-storage
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:3000/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  worker:
+    image: twentycrm/twenty:${TWENTY_TAG:-v2.2.0}
+    command: ["yarn", "worker:prod"]
+    environment:
+      <<: *twenty-env
+      DISABLE_DB_MIGRATIONS: "true"
+      DISABLE_CRON_JOBS_REGISTRATION: "true"
+    volumes:
+      - server-data:/app/packages/twenty-server/.local-storage
+    depends_on:
+      server: { condition: service_healthy }
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PG_DATABASE_PASSWORD}
+      POSTGRES_DB: default
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  db-data:
+  server-data:

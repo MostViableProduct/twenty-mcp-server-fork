@@ -1,0 +1,190 @@
+name: Integration
+
+# Drives the bundled stdio MCP server against a real Twenty container,
+# exercises every registered tool with synthetic data, and fails on any
+# regression. Two triggers:
+#   1. PRs / pushes — uses the pinned Twenty tag in scripts/twenty-tag.
+#   2. Daily cron + manual dispatch — also runs against the latest
+#      twentyhq/twenty release; opens an issue if any required tool fails
+#      so the fork can keep up with upstream drift, or opens a tag-bump PR
+#      if everything still passes.
+
+on:
+  push:
+    branches: [main, entrylvl-fixes]
+  pull_request:
+    branches: [main, entrylvl-fixes]
+  schedule:
+    - cron: '0 14 * * *'
+  workflow_dispatch:
+    inputs:
+      twenty_tag:
+        description: 'Twenty tag to test against (e.g. v2.2.0). Leave empty to use the pinned tag.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  resolve-tags:
+    runs-on: ubuntu-latest
+    outputs:
+      pinned: ${{ steps.pick.outputs.pinned }}
+      latest: ${{ steps.pick.outputs.latest }}
+      run_latest: ${{ steps.pick.outputs.run_latest }}
+    env:
+      # Untrusted input — passed only via env, never substituted into a
+      # `run:` script body. The validation step below also enforces a
+      # tight regex before we trust the value.
+      INPUT_TAG: ${{ github.event.inputs.twenty_tag }}
+      EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Pinned tag is committed in the fork; PRs verify against it.
+          if [ -f scripts/twenty-tag ]; then
+            PINNED=$(tr -d '[:space:]' < scripts/twenty-tag)
+          else
+            PINNED=v2.2.0
+          fi
+          # Manual override wins, but only after passing a tag-shape check.
+          if [ -n "${INPUT_TAG:-}" ]; then
+            if ! printf '%s' "$INPUT_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+              echo "::error::twenty_tag input failed shape check: $INPUT_TAG" >&2
+              exit 1
+            fi
+            PINNED="$INPUT_TAG"
+          fi
+          if ! printf '%s' "$PINNED" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+            echo "::error::resolved pinned tag failed shape check: $PINNED" >&2
+            exit 1
+          fi
+          echo "pinned=$PINNED" >> "$GITHUB_OUTPUT"
+
+          # Latest upstream Twenty release. Used only by cron + dispatch.
+          LATEST=$(gh api repos/twentyhq/twenty/releases/latest --jq '.tag_name' || echo "")
+          if [ -z "$LATEST" ] || ! printf '%s' "$LATEST" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+            LATEST="$PINNED"
+          fi
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+
+          if [ "$EVENT_NAME" = "schedule" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "run_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    needs: resolve-tags
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tag: ${{ needs.resolve-tags.outputs.pinned }}
+            label: pinned
+            required: true
+          - tag: ${{ needs.resolve-tags.outputs.latest }}
+            label: latest
+            required: false
+    runs-on: ubuntu-latest
+    name: integration (${{ matrix.label }} = ${{ matrix.tag }})
+    if: ${{ matrix.label == 'pinned' || needs.resolve-tags.outputs.run_latest == 'true' }}
+    env:
+      MATRIX_TAG: ${{ matrix.tag }}
+      MATRIX_LABEL: ${{ matrix.label }}
+      MATRIX_REQUIRED: ${{ matrix.required }}
+      PINNED_TAG: ${{ needs.resolve-tags.outputs.pinned }}
+      LATEST_TAG: ${{ needs.resolve-tags.outputs.latest }}
+      EVENT_NAME: ${{ github.event_name }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+
+      - name: Spin up Twenty
+        env:
+          TWENTY_TAG: ${{ matrix.tag }}
+        run: bash scripts/spin-up-twenty.sh
+
+      - name: Run integration harness
+        id: harness
+        # set +e so we collect the JSON report even on failure.
+        run: |
+          set +e
+          node scripts/integration-test.mjs --json > integration-report.json
+          rc=$?
+          set -e
+          node scripts/integration-test.mjs || true
+          echo "harness_rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ] && [ "$MATRIX_REQUIRED" = "true" ]; then
+            exit "$rc"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-report-${{ matrix.label }}
+          path: integration-report.json
+
+      - name: Tear down
+        if: always()
+        run: bash scripts/tear-down-twenty.sh || true
+
+      - name: Open drift issue if latest failed
+        if: ${{ matrix.label == 'latest' && steps.harness.outputs.harness_rc != '0' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REPORT=$(jq -c '{summary, failed: [.results[] | select(.required and .status=="FAIL") | {name, detail}]}' integration-report.json)
+          TITLE="drift: required tools failing against Twenty $LATEST_TAG"
+          BODY="The integration harness was run against upstream Twenty \`$LATEST_TAG\` and at least one *required* tool regressed.
+
+          - Pinned: \`$PINNED_TAG\`
+          - Latest: \`$LATEST_TAG\`
+          - Workflow run: $RUN_URL
+
+          ### Failure summary
+          \`\`\`json
+          $REPORT
+          \`\`\`
+
+          Pull the \`integration-report-latest\` artifact for the full per-tool detail."
+
+          EXISTING=$(gh issue list --search "in:title \"$TITLE\" is:open" --json number --jq '.[0].number' || echo "")
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY" --label drift --label upstream
+          fi
+
+      - name: Bump pinned tag if latest passed
+        if: ${{ matrix.label == 'latest' && steps.harness.outputs.harness_rc == '0' && needs.resolve-tags.outputs.latest != needs.resolve-tags.outputs.pinned && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BRANCH="bump-twenty/$LATEST_TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          printf '%s\n' "$LATEST_TAG" > scripts/twenty-tag
+          git add scripts/twenty-tag
+          git commit -m "ci: bump pinned Twenty tag $PINNED_TAG -> $LATEST_TAG"
+          git push -u origin "$BRANCH" --force
+          gh pr create \
+            --title "ci: bump pinned Twenty tag -> $LATEST_TAG" \
+            --body "All required tools pass against upstream Twenty \`$LATEST_TAG\` (run: $RUN_URL). Safe to bump the pinned tag." \
+            --label drift --label upstream || true

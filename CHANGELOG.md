@@ -2,6 +2,62 @@
 
 All notable changes to Twenty MCP Server will be documented in this file.
 
+## [1.3.0-entrylvl.1] - 2026-05-05 (MostViableProduct fork)
+
+Fork of upstream `1.3.0` published as `MostViableProduct/twenty-mcp-server-fork`.
+Fixes the integration against Twenty v2.x and adds drift-tracking CI.
+
+### 🐛 Fixes against Twenty v2.x
+
+- **`list_all_objects`**: queries now go to the `/metadata` endpoint
+  (object metadata moved out of `/graphql`) and use `paging: CursorPaging`
+  on the connection (`totalCount` was removed).
+- **`get_object_schema`**: dropped the non-existent `ObjectFilterInput`
+  type. UUID lookups use the singular `object(id:)` query; name lookups
+  list active objects and filter client-side because v2.x's `ObjectFilter`
+  has no `nameSingular` / `namePlural` fields.
+- **`get_field_metadata`**: per-object path delegates to the rebuilt
+  `getObjectSchema`; all-fields path uses the metadata API's top-level
+  `fields(paging:)` connection.
+- **`create_note` / `create_task` / `getTasks`**: replaced the removed
+  plaintext `body` field with v2.x's `bodyV2: RichText { markdown }`.
+  Callers can still pass `{ body: "…" }` — the client normalises to
+  `{ bodyV2: { markdown: "…" } }` on input and lifts back to a flat
+  `body` string on output.
+
+### 🐛 Fixes to the CLI wrapper
+
+- **`twenty-mcp start --stdio`**: resolves `dist/index.js` from the
+  package directory (via `import.meta.url`) instead of `process.cwd()`,
+  so global / npx / Docker installs no longer trip on the missing
+  `./dist`. The build fallback also targets the package root.
+- **No more required `.env`**: env vars passed by the parent process
+  (Claude Code's MCP `env` block, exported shell env, etc.) now satisfy
+  the configuration check. A `.env` file is honoured if present but
+  optional.
+- **stdio-safe logging**: chatty CLI output goes to stderr in stdio mode
+  so the MCP framing on stdout stays clean.
+
+### 🧪 Testing
+
+- New `scripts/spin-up-twenty.sh` / `tear-down-twenty.sh` plus
+  `scripts/integration-twenty.compose.yml` to launch a clean Twenty
+  workspace, sign up an admin, and mint an Admin-role API key.
+- `scripts/integration-test.mjs` drives the bundled stdio server via the
+  MCP client SDK, exercises every registered tool with synthetic data,
+  and exits non-zero on any *required* tool regression. JSON output via
+  `--json` for CI consumption.
+- Pinned Twenty tag committed at `scripts/twenty-tag` (currently `v2.2.0`).
+
+### ⚙️ CI
+
+- New `.github/workflows/integration.yml`:
+  - PRs / pushes verify against the pinned tag.
+  - Daily cron + `workflow_dispatch` also run against the latest
+    `twentyhq/twenty` release. On regression: opens a `drift,upstream`
+    issue with the failing-tool report. On a clean run with a newer tag
+    available: opens a tag-bump PR.
+
 ## [1.3.0] - 2026-01-12
 
 ### 🎉 Added

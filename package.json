@@ -1,6 +1,6 @@
 {
   "name": "twenty-mcp-server",
-  "version": "1.3.0",
+  "version": "1.3.0-entrylvl.1",
   "description": "Easy-to-install Model Context Protocol server for Twenty CRM. Try instantly with 'npx twenty-mcp-server setup' or install globally for permanent use.",
   "main": "dist/http-server.js",
   "module": "./src/http-server.ts",
@@ -30,6 +30,10 @@
     "docker:run": "docker run -p 3000:3000 -e TWENTY_API_KEY=$TWENTY_API_KEY -e TWENTY_BASE_URL=$TWENTY_BASE_URL twenty-mcp",
     "prepack": "npm run build && npm run test:smoke",
     "prepublishOnly": "npm run prepack",
+    "prepare": "npm run build",
+    "test:integration": "node scripts/integration-test.mjs",
+    "twenty:up": "bash scripts/spin-up-twenty.sh",
+    "twenty:down": "bash scripts/tear-down-twenty.sh",
     "postinstall": "node -e \"if (process.env.npm_command !== 'exec') { console.log('\\n🎉 Twenty MCP Server installed! Run \\\"twenty-mcp setup\\\" to get started.\\n'); } else { console.log('\\n✨ Running via npx - configuration will persist between runs!\\n'); }\""
   },
   "keywords": [
@@ -60,7 +64,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/jezweb/twenty-mcp.git"
+    "url": "https://github.com/MostViableProduct/twenty-mcp-server-fork.git"
   },
   "bugs": {
     "url": "https://github.com/jezweb/twenty-mcp/issues"
@@ -69,7 +73,6 @@
   "dependencies": {
     "@clerk/clerk-sdk-node": "^5.0.0",
     "@clerk/types": "^4.0.0",
-    "@modelcontextprotocol/sdk": "^1.25.2",
     "@types/inquirer": "^9.0.8",
     "chalk": "^5.4.1",
     "commander": "^14.0.0",
@@ -79,6 +82,7 @@
     "zod": "^3.22.4"
   },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/node": "^20.10.0",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",

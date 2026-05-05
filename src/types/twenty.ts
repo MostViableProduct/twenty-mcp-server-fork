@@ -65,10 +65,21 @@ export interface Company {
   accountOwnerId?: string;
 }
 
+// Twenty v2.x replaced the plaintext `body` field on Note/Task with a
+// RichText object addressed as `bodyV2`. We accept a plain `body` string
+// at the type boundary (ergonomic) and map it to `{ markdown }` in the
+// client. `bodyV2` is also accepted directly for callers that want to
+// supply blocknote.
+export interface RichTextInput {
+  markdown?: string;
+  blocknote?: string;
+}
+
 export interface Task {
   id?: string;
   title: string;
   body?: string;
+  bodyV2?: RichTextInput;
   dueAt?: string;
   status?: 'TODO' | 'IN_PROGRESS' | 'DONE';
   assigneeId?: string;
@@ -77,7 +88,8 @@ export interface Task {
 export interface Note {
   id?: string;
   title?: string;
-  body: string;
+  body?: string;
+  bodyV2?: RichTextInput;
   authorId?: string;
 }
 
